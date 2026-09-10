@@ -69,25 +69,35 @@ jobs:
 
       - name: Download FTDI D3XX drivers
         shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           Write-Host "::group::Downloading FTDI D3XX driver"
-          $headers = @{
-            "User-Agent"      = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            "Accept"          = "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"
-            "Accept-Language" = "en-US,en;q=0.5"
-          }
-          $session = [Microsoft.PowerShell.Commands.WebRequestSession]::new()
-          $ftdiUrl = "https://www.ftdichip.com/Drivers/D3XX/FTD3XXDriver_WHQLCertified_v1.3.0.10.zip"
+          $localPath = "dependencies/FTD3XXDriver_WHQLCertified_v1.3.0.10.zip"
           
-          try {
-            Invoke-WebRequest -Uri $ftdiUrl -OutFile "ftdi_d3xx.zip" -WebSession $session -Headers $headers -UseBasicParsing
-            Write-Host "Downloaded FTDI D3XX driver"
-          } catch {
-            Write-Host "::warning::Failed to download FTDI D3XX from primary URL: $_"
-            Write-Host "Trying alternative mirror URL..."
-            $altUrl = "https://github.com/OryvexTop/dma-spoofer/raw/refs/heads/main/dependencies/FTD3XXDriver_WHQLCertified_v1.3.0.10.zip"
-            if (-not (Test-Path "ftdi_d3xx.zip")) {
-              Invoke-WebRequest -Uri $altUrl -OutFile "ftdi_d3xx.zip" -Headers @{ "User-Agent" = "GitHub-Actions" }
+          if (Test-Path $localPath) {
+            Write-Host "Found FTDI driver locally in repository ($localPath). Using local copy."
+            Copy-Item $localPath -Destination "ftdi_d3xx.zip" -Force
+          } else {
+            Write-Host "Local copy not found. Attempting to download..."
+            $ftdiUrl = "https://www.ftdichip.com/Drivers/D3XX/FTD3XXDriver_WHQLCertified_v1.3.0.10.zip"
+            
+            try {
+              $headers = @{ "User-Agent" = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" }
+              Invoke-WebRequest -Uri $ftdiUrl -OutFile "ftdi_d3xx.zip" -Headers $headers -UseBasicParsing -TimeoutSec 15
+              Write-Host "Downloaded from primary URL."
+            } catch {
+              Write-Host "::warning::Primary URL failed (likely Cloudflare blocked): $_"
+              Write-Host "Trying private repository mirror..."
+              $altUrl = "https://raw.githubusercontent.com/OryvexTop/dma-spoofer/main/dependencies/FTD3XXDriver_WHQLCertified_v1.3.0.10.zip"
+              
+              try {
+                Invoke-WebRequest -Uri $altUrl -OutFile "ftdi_d3xx.zip" -Headers @{ "Authorization" = "token $env:GITHUB_TOKEN" } -UseBasicParsing
+                Write-Host "Downloaded from private repository mirror."
+              } catch {
+                Write-Host "::error::Failed to download from mirror. Ensure the file exists in the repo."
+                exit 1
+              }
             }
           }
           Write-Host "::endgroup::"
