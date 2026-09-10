@@ -33,7 +33,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - name: Download MemProcFS (latest)
+      - name: Download MemProcFS and Extract DLLs
         shell: pwsh
         run: |
           Write-Host "::group::Fetching latest MemProcFS release"
@@ -46,15 +46,15 @@ jobs:
           Invoke-WebRequest -Uri $asset.browser_download_url -OutFile "memprocfs.zip" -UserAgent "GitHub-Actions"
           Write-Host "::endgroup::"
 
-          Write-Host "::group::Extracting MemProcFS"
+          Write-Host "::group::Extracting Archive"
           Expand-Archive -Path "memprocfs.zip" -DestinationPath "memprocfs_extracted" -Force
-          Get-ChildItem -Path "memprocfs_extracted" -Recurse -Filter "*.dll" | Select-Object FullName
           Write-Host "::endgroup::"
 
-          Write-Host "::group::Copying DLLs"
+          Write-Host "::group::Copying all required DLLs"
           New-Item -ItemType Directory -Force -Path "dlls" | Out-Null
 
-          $dllsToFind = @("vmm.dll", "leechcore.dll", "vmmyara.dll")
+          # FTD3XX.dll and FTD3XXWU.dll are included in the MemProcFS release
+          $dllsToFind = @("vmm.dll", "leechcore.dll", "vmmyara.dll", "FTD3XX.dll", "FTD3XXWU.dll")
           foreach ($dll in $dllsToFind) {
             $found = Get-ChildItem -Path "memprocfs_extracted" -Recurse -Filter $dll -ErrorAction SilentlyContinue | Select-Object -First 1
             if ($found) {
@@ -64,65 +64,8 @@ jobs:
               Write-Host "::warning::Could not find $dll in MemProcFS archive"
             }
           }
-          Get-ChildItem -Path "dlls" | Select-Object Name, Length
-          Write-Host "::endgroup::"
-
-      - name: Download FTDI D3XX drivers
-        shell: pwsh
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          Write-Host "::group::Downloading FTDI D3XX driver"
-          $localPath = "dependencies/FTD3XXDriver_WHQLCertified_v1.3.0.10.zip"
           
-          if (Test-Path $localPath) {
-            Write-Host "Found FTDI driver locally in repository ($localPath). Using local copy."
-            Copy-Item $localPath -Destination "ftdi_d3xx.zip" -Force
-          } else {
-            Write-Host "Local copy not found. Attempting to download..."
-            $ftdiUrl = "https://www.ftdichip.com/Drivers/D3XX/FTD3XXDriver_WHQLCertified_v1.3.0.10.zip"
-            
-            try {
-              $headers = @{ "User-Agent" = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" }
-              Invoke-WebRequest -Uri $ftdiUrl -OutFile "ftdi_d3xx.zip" -Headers $headers -UseBasicParsing -TimeoutSec 15
-              Write-Host "Downloaded from primary URL."
-            } catch {
-              Write-Host "::warning::Primary URL failed (likely Cloudflare blocked): $_"
-              Write-Host "Trying private repository mirror..."
-              $altUrl = "https://raw.githubusercontent.com/OryvexTop/dma-spoofer/main/dependencies/FTD3XXDriver_WHQLCertified_v1.3.0.10.zip"
-              
-              try {
-                Invoke-WebRequest -Uri $altUrl -OutFile "ftdi_d3xx.zip" -Headers @{ "Authorization" = "token $env:GITHUB_TOKEN" } -UseBasicParsing
-                Write-Host "Downloaded from private repository mirror."
-              } catch {
-                Write-Host "::error::Failed to download from mirror. Ensure the file exists in the repo."
-                exit 1
-              }
-            }
-          }
-          Write-Host "::endgroup::"
-
-          Write-Host "::group::Extracting FTDI D3XX"
-          Expand-Archive -Path "ftdi_d3xx.zip" -DestinationPath "ftdi_extracted" -Force
-          Get-ChildItem -Path "ftdi_extracted" -Recurse -Filter "*.dll" | Select-Object FullName
-          Write-Host "::endgroup::"
-
-          Write-Host "::group::Copying FTDI DLLs"
-          $ftd3xx = Get-ChildItem -Path "ftdi_extracted" -Recurse -Filter "FTD3XX.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
-          if ($ftd3xx) {
-            Copy-Item $ftd3xx.FullName -Destination "dlls\" -Force
-            Write-Host "Copied: FTD3XX.dll"
-          } else {
-            Write-Host "::warning::FTD3XX.dll not found in archive"
-          }
-
-          $ftd3xxwu = Get-ChildItem -Path "ftdi_extracted" -Recurse -Filter "FTD3XXWU.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
-          if ($ftd3xxwu) {
-            Copy-Item $ftd3xxwu.FullName -Destination "dlls\" -Force
-            Write-Host "Copied: FTD3XXWU.dll"
-          } else {
-            Write-Host "::warning::FTD3XXWU.dll not found (optional)"
-          }
+          Get-ChildItem -Path "dlls" | Select-Object Name, Length
           Write-Host "::endgroup::"
 
       - name: Build release
