@@ -43,7 +43,7 @@ jobs:
             $asset = $release.assets | Select-Object -First 1
           }
           Write-Host "Downloading: $($asset.name) from $($asset.browser_download_url)"
-          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile "memprocfs.zip"
+          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile "memprocfs.zip" -UserAgent "GitHub-Actions"
           Write-Host "::endgroup::"
 
           Write-Host "::group::Extracting MemProcFS"
@@ -71,15 +71,24 @@ jobs:
         shell: pwsh
         run: |
           Write-Host "::group::Downloading FTDI D3XX driver"
+          $headers = @{
+            "User-Agent"      = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            "Accept"          = "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"
+            "Accept-Language" = "en-US,en;q=0.5"
+          }
+          $session = [Microsoft.PowerShell.Commands.WebRequestSession]::new()
           $ftdiUrl = "https://www.ftdichip.com/Drivers/D3XX/FTD3XXDriver_WHQLCertified_v1.3.0.10.zip"
+          
           try {
-            Invoke-WebRequest -Uri $ftdiUrl -OutFile "ftdi_d3xx.zip" -UseBasicParsing
+            Invoke-WebRequest -Uri $ftdiUrl -OutFile "ftdi_d3xx.zip" -WebSession $session -Headers $headers -UseBasicParsing
             Write-Host "Downloaded FTDI D3XX driver"
           } catch {
             Write-Host "::warning::Failed to download FTDI D3XX from primary URL: $_"
-            Write-Host "Trying alternative URL..."
-            $altUrl = "https://ftdichip.com/wp-content/uploads/2020/07/FTD3XXDriver_WHQLCertified_v1.3.0.10.zip"
-            Invoke-WebRequest -Uri $altUrl -OutFile "ftdi_d3xx.zip" -UseBasicParsing
+            Write-Host "Trying alternative mirror URL..."
+            $altUrl = "https://github.com/OryvexTop/dma-spoofer/raw/refs/heads/main/dependencies/FTD3XXDriver_WHQLCertified_v1.3.0.10.zip"
+            if (-not (Test-Path "ftdi_d3xx.zip")) {
+              Invoke-WebRequest -Uri $altUrl -OutFile "ftdi_d3xx.zip" -Headers @{ "User-Agent" = "GitHub-Actions" }
+            }
           }
           Write-Host "::endgroup::"
 
@@ -89,7 +98,6 @@ jobs:
           Write-Host "::endgroup::"
 
           Write-Host "::group::Copying FTDI DLLs"
-          # FTD3XX.dll - the main driver DLL
           $ftd3xx = Get-ChildItem -Path "ftdi_extracted" -Recurse -Filter "FTD3XX.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
           if ($ftd3xx) {
             Copy-Item $ftd3xx.FullName -Destination "dlls\" -Force
@@ -98,18 +106,13 @@ jobs:
             Write-Host "::warning::FTD3XX.dll not found in archive"
           }
 
-          # FTD3XXWU.dll - Windows Update variant (may not exist in all versions)
           $ftd3xxwu = Get-ChildItem -Path "ftdi_extracted" -Recurse -Filter "FTD3XXWU.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
           if ($ftd3xxwu) {
             Copy-Item $ftd3xxwu.FullName -Destination "dlls\" -Force
             Write-Host "Copied: FTD3XXWU.dll"
           } else {
-            Write-Host "::warning::FTD3XXWU.dll not found (may not exist in this driver version - this is OK)"
+            Write-Host "::warning::FTD3XXWU.dll not found (optional)"
           }
-          Write-Host "::endgroup::"
-
-          Write-Host "::group::Final DLL list"
-          Get-ChildItem -Path "dlls" -ErrorAction SilentlyContinue | Select-Object Name, Length
           Write-Host "::endgroup::"
 
       - name: Build release
@@ -124,13 +127,6 @@ jobs:
           } else {
             Write-Host "::warning::No dlls folder found"
           }
-
-      - name: List final output
-        shell: pwsh
-        run: |
-          Write-Host "::group::Final build output"
-          Get-ChildItem -Path "target\release" | Where-Object { $_.Name -match "\.(exe|dll)$" } | Select-Object Name, Length
-          Write-Host "::endgroup::"
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
