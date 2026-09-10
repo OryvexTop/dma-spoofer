@@ -5,7 +5,7 @@ on:
     branches: [ main, master ]
   pull_request:
     branches: [ main, master ]
-  workflow_dispatch:  # اجازه بیلد دستی
+  workflow_dispatch:
 
 jobs:
   build:
@@ -30,13 +30,26 @@ jobs:
             ~/.cargo/git/db/
             target/
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
 
       - name: Build release
         run: cargo build --release --verbose
 
-      - name: Copy DLLs next to executable
+      - name: Show what was built
         run: |
-          Copy-Item -Path "dlls\*" -Destination "target\release\" -Force
+          Get-ChildItem -Path "target\release" -Filter "*.exe"
+          Get-ChildItem -Path "target\release" -Filter "*.dll"
+
+      - name: Copy DLLs if they exist
+        run: |
+          if (Test-Path "dlls") {
+            Write-Host "Found dlls folder, copying..."
+            Copy-Item -Path "dlls\*" -Destination "target\release\" -Force
+            Get-ChildItem -Path "target\release" -Filter "*.dll"
+          } else {
+            Write-Host "::warning::dlls folder not found - skipping DLL copy. The exe will need DLLs added manually."
+          }
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
@@ -45,4 +58,5 @@ jobs:
           path: |
             target/release/dma-spoofer.exe
             target/release/*.dll
+          if-no-files-found: warn
           retention-days: 30
