@@ -11,31 +11,58 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install WDK
+      - name: Install WDK + SDK 22621
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $vsInstaller = "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vs_installer.exe"
-          $vsPath = "C:\Program Files\Microsoft Visual Studio\2022\Enterprise"
 
-          Write-Host "installing WDK + SDK 22621..."
-          $args = @(
+          $vsInstaller = "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vs_installer.exe"
+          $vsPath      = "C:\Program Files\Microsoft Visual Studio\2022\Enterprise"
+
+          Write-Host "== Adding SDK + WDK via VS installer =="
+          $vsArgs = @(
             "modify",
             "--installPath", "`"$vsPath`"",
             "--add", "Microsoft.VisualStudio.Component.Windows11SDK.22621",
-            "--add", "Microsoft.VisualStudio.Component.WDK",
+            "--add", "Microsoft.VisualStudio.Component.WDK11",
             "--quiet", "--norestart", "--nocache"
           )
-          $p = Start-Process -FilePath $vsInstaller -ArgumentList $args -Wait -PassThru
-          Write-Host "installer exit: $($p.ExitCode)"
+          $p = Start-Process -FilePath $vsInstaller -ArgumentList $vsArgs -Wait -PassThru
+          Write-Host "vs_installer exit: $($p.ExitCode)"
 
-          # verify
-          $ntddk = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Include" -Filter ntddk.h -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-          if (-not $ntddk) {
-            Write-Host "WDK headers not found via installer, trying winget..."
-            winget install --id Microsoft.WindowsWDK.10.0.22621 --accept-source-agreements --accept-package-agreements --silent
+          $ntddkPath = "C:\Program Files (x86)\Windows Kits\10\Include\10.0.22621.0\km\ntddk.h"
+
+          if (-not (Test-Path $ntddkPath)) {
+            Write-Host "== WDK headers not found, installing standalone WDK + SDK =="
+
+            $sdkUrl = "https://go.microsoft.com/fwlink/?linkid=2272610"   # Win11 SDK 22621
+            $wdkUrl = "https://go.microsoft.com/fwlink/?linkid=2272615"   # Win11 WDK 22621
+
+            Invoke-WebRequest -Uri $sdkUrl -OutFile "$env:TEMP\sdksetup.exe" -UseBasicParsing
+            Invoke-WebRequest -Uri $wdkUrl -OutFile "$env:TEMP\wdksetup.exe" -UseBasicParsing
+
+            Start-Process "$env:TEMP\sdksetup.exe" `
+              -ArgumentList "/quiet /norestart /features OptionId.WindowsSoftwareDevelopmentKit" `
+              -Wait
+
+            # WDK installer requires the SDK; give it a moment
+            Start-Sleep -Seconds 5
+
+            Start-Process "$env:TEMP\wdksetup.exe" `
+              -ArgumentList "/quiet /norestart /features OptionId.DesktopCPPx64" `
+              -Wait
+
+            Start-Sleep -Seconds 5
           }
-          Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Include" | Select-Object Name
+
+          Write-Host "== Verifying WDK headers =="
+          if (-not (Test-Path $ntddkPath)) {
+            Write-Host "Available Include folders:"
+            Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Include" -ErrorAction SilentlyContinue |
+              Select-Object -ExpandProperty Name
+            throw "ntddk.h still missing at $ntddkPath after WDK install"
+          }
+          Write-Host "Found: $ntddkPath"
 
       - name: Write driver source
         shell: pwsh
@@ -156,18 +183,27 @@ jobs:
                 <Platform>x64</Platform>
               </ProjectConfiguration>
             </ItemGroup>
+
             <PropertyGroup Label="Globals">
               <ProjectGuid>{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}</ProjectGuid>
               <RootNamespace>ramsploof</RootNamespace>
               <WindowsTargetPlatformVersion>10.0.22621.0</WindowsTargetPlatformVersion>
             </PropertyGroup>
+
             <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+
             <PropertyGroup Label="Configuration">
               <ConfigurationType>DynamicLibrary</ConfigurationType>
               <PlatformToolset>v143</PlatformToolset>
               <CharacterSet>Unicode</CharacterSet>
             </PropertyGroup>
+
             <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+
+            <PropertyGroup>
+              <WindowsSdkDir Condition="'$(WindowsSdkDir)'==''">C:\Program Files (x86)\Windows Kits\10\</WindowsSdkDir>
+            </PropertyGroup>
+
             <ItemDefinitionGroup>
               <ClCompile>
                 <PreprocessorDefinitions>_AMD64_;AMD64;DBG=0;NDEBUG;POOL_NX_OPTIN=1;_KERNEL_MODE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
@@ -199,9 +235,11 @@ jobs:
                 <Command>copy /Y "$(TargetPath)" "$(TargetDir)ramsploof.sys"</Command>
               </PostBuildEvent>
             </ItemDefinitionGroup>
+
             <ItemGroup>
               <ClCompile Include="ramsploof.c" />
             </ItemGroup>
+
             <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
           </Project>
           '@ | Set-Content -Path ramsploof.vcxproj -Encoding UTF8
@@ -215,7 +253,21 @@ jobs:
         shell: cmd
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
-          msbuild ramsploof.vcxproj /p:Configuration=Release /p:Platform=x64 /m /v:minimal
+          msbuild ramsploof.vcxproj ^
+            /p:Configuration=Release ^
+            /p:Platform=x64 ^
+            /p:WindowsTargetPlatformVersion=10.0.22621.0 ^
+            /m /v:minimal
+
+      - name: Verify build output
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "x64\Release\ramsploof.sys")) {
+            Write-Host "== Build directory contents =="
+            Get-ChildItem -Recurse x64 -ErrorAction SilentlyContinue | Select-Object FullName
+            throw "ramsploof.sys was not produced"
+          }
+          Get-ChildItem x64\Release | Select-Object Name, Length
 
       - name: Generate test cert
         shell: pwsh
@@ -226,6 +278,7 @@ jobs:
             -CertStoreLocation Cert:\CurrentUser\My `
             -KeyUsage DigitalSignature `
             -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.3")
+
           Export-Certificate -Cert $cert -FilePath testcert.cer | Out-Null
           Export-PfxCertificate -Cert $cert -FilePath testcert.pfx `
             -Password (ConvertTo-SecureString "test" -AsPlainText -Force) | Out-Null
@@ -233,7 +286,9 @@ jobs:
       - name: Sign driver
         shell: cmd
         run: |
-          signtool sign /fd SHA256 /f testcert.pfx /p test /tr http://timestamp.digicert.com /td SHA256 /v x64\Release\ramsploof.sys
+          signtool sign /fd SHA256 /f testcert.pfx /p test ^
+            /tr http://timestamp.digicert.com /td SHA256 /v ^
+            x64\Release\ramsploof.sys
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
