@@ -2,7 +2,7 @@ name: build-ramsploof
 
 on:
   push:
-    branches: [main]
+    branches: [main, master]
   workflow_dispatch:
 
 jobs:
@@ -17,6 +17,7 @@ jobs:
           @'
           #include <ntddk.h>
           #include <wdm.h>
+          #include <ntstrsafe.h>
 
           #define SPOOF_SIG 0x52534D42
           #define SYS_FW_TABLE_INFO 76
@@ -35,10 +36,9 @@ jobs:
           #pragma pack(pop)
 
           typedef NTSTATUS (*PFN_NtQSI)(ULONG, PVOID, ULONG, PULONG);
-          static PFN_NtQSI g_orig = NULL;
-          static PVOID     g_target = NULL;
-          static UCHAR     g_orig_bytes[14];
-          static BOOLEAN   g_hooked = FALSE;
+          static PVOID g_target = NULL;
+          static UCHAR g_orig_bytes[14];
+          static BOOLEAN g_hooked = FALSE;
 
           #pragma pack(push,1)
           typedef struct _TRAMP { UCHAR code[14]; UCHAR jmp_back[14]; } TRAMP;
@@ -107,7 +107,7 @@ jobs:
               g_hooked = FALSE;
           }
 
-          VOID Unload(PDRIVER_OBJECT d){ remove_hook(); DbgPrint("[ramsploof] unloaded\n"); }
+          VOID Unload(PDRIVER_OBJECT d){ UNREFERENCED_PARAMETER(d); remove_hook(); DbgPrint("[ramsploof] unloaded\n"); }
 
           NTSTATUS DriverEntry(PDRIVER_OBJECT d, PUNICODE_STRING r){
               UNREFERENCED_PARAMETER(r);
@@ -137,27 +137,59 @@ jobs:
             </PropertyGroup>
             <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
             <PropertyGroup Label="Configuration">
-              <ConfigurationType>Driver</ConfigurationType>
-              <DriverType>WDM</DriverType>
-              <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
+              <ConfigurationType>DynamicLibrary</ConfigurationType>
+              <PlatformToolset>v143</PlatformToolset>
+              <CharacterSet>Unicode</CharacterSet>
             </PropertyGroup>
             <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+            <ItemDefinitionGroup>
+              <ClCompile>
+                <PreprocessorDefinitions>_AMD64_;AMD64;DBG=0;NDEBUG;POOL_NX_OPTIN=1;_KERNEL_MODE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+                <AdditionalIncludeDirectories>$(WindowsSdkDir)Include\$(WindowsTargetPlatformVersion)\km;$(WindowsSdkDir)Include\$(WindowsTargetPlatformVersion)\km\crt;$(WindowsSdkDir)Include\$(WindowsTargetPlatformVersion)\shared;$(WindowsSdkDir)Include\$(WindowsTargetPlatformVersion)\ucrt;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+                <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+                <BufferSecurityCheck>false</BufferSecurityCheck>
+                <ExceptionHandling>false</ExceptionHandling>
+                <BasicRuntimeChecks>Default</BasicRuntimeChecks>
+                <WarningLevel>Level3</WarningLevel>
+                <TreatWarningAsError>false</TreatWarningAsError>
+                <Optimization>MaxSpeed</Optimization>
+                <DisableSpecificWarnings>4100;4189;4201;4214;4244;4267;4324;4742;%(DisableSpecificWarnings)</DisableSpecificWarnings>
+              </ClCompile>
+              <Link>
+                <SubSystem>Native</SubSystem>
+                <EntryPointSymbol>DriverEntry</EntryPointSymbol>
+                <AdditionalDependencies>ntoskrnl.lib;hal.lib;ntstrsafe.lib;BufferOverflowK.lib;wdmsec.lib;wmilib.lib;%(AdditionalDependencies)</AdditionalDependencies>
+                <AdditionalLibraryDirectories>$(WindowsSdkDir)Lib\$(WindowsTargetPlatformVersion)\km\x64;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+                <GenerateDebugInformation>true</GenerateDebugInformation>
+                <OptimizeReferences>true</OptimizeReferences>
+                <EnableCOMDATFolding>true</EnableCOMDATFolding>
+                <SetChecksum>true</SetChecksum>
+                <RandomizedBaseAddress>false</RandomizedBaseAddress>
+                <DataExecutionPrevention>true</DataExecutionPrevention>
+                <ImportLibrary>$(OutDir)ramsploof.lib</ImportLibrary>
+                <TargetMachine>MachineX64</TargetMachine>
+              </Link>
+              <PostBuildEvent>
+                <Command>copy /Y "$(TargetPath)" "$(TargetDir)ramsploof.sys"</Command>
+              </PostBuildEvent>
+            </ItemDefinitionGroup>
             <ItemGroup>
               <ClCompile Include="ramsploof.c" />
             </ItemGroup>
             <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
-            <Import Project="$(WDKContentRoot)\build\WindowsKernelModeDriver.props" />
           </Project>
           '@ | Set-Content -Path ramsploof.vcxproj -Encoding UTF8
 
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v2
+        with:
+          msbuild-architecture: x64
 
       - name: Build driver
         shell: cmd
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
-          msbuild ramsploof.vcxproj /p:Configuration=Release /p:Platform=x64 /m
+          msbuild ramsploof.vcxproj /p:Configuration=Release /p:Platform=x64 /m /v:minimal
 
       - name: Generate test cert
         shell: pwsh
@@ -183,5 +215,6 @@ jobs:
           name: ramsploof-build
           path: |
             x64/Release/ramsploof.sys
+            x64/Release/ramsploof.dll
             testcert.cer
             testcert.pfx
