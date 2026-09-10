@@ -11,6 +11,32 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install WDK
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $vsInstaller = "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vs_installer.exe"
+          $vsPath = "C:\Program Files\Microsoft Visual Studio\2022\Enterprise"
+
+          Write-Host "installing WDK + SDK 22621..."
+          $args = @(
+            "modify",
+            "--installPath", "`"$vsPath`"",
+            "--add", "Microsoft.VisualStudio.Component.Windows11SDK.22621",
+            "--add", "Microsoft.VisualStudio.Component.WDK",
+            "--quiet", "--norestart", "--nocache"
+          )
+          $p = Start-Process -FilePath $vsInstaller -ArgumentList $args -Wait -PassThru
+          Write-Host "installer exit: $($p.ExitCode)"
+
+          # verify
+          $ntddk = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Include" -Filter ntddk.h -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $ntddk) {
+            Write-Host "WDK headers not found via installer, trying winget..."
+            winget install --id Microsoft.WindowsWDK.10.0.22621 --accept-source-agreements --accept-package-agreements --silent
+          }
+          Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Include" | Select-Object Name
+
       - name: Write driver source
         shell: pwsh
         run: |
