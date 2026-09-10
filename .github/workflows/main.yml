@@ -1,92 +1,187 @@
-name: Build dma-spoofer
+name: build-ramsploof
 
 on:
   push:
-    branches: [ main, master ]
-  pull_request:
-    branches: [ main, master ]
+    branches: [main]
   workflow_dispatch:
 
 jobs:
   build:
-    runs-on: windows-latest
-
+    runs-on: windows-2022
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-pc-windows-msvc
-
-      - name: Cache Cargo dependencies
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
-
-      - name: Download MemProcFS and Extract DLLs
+      - name: Write driver source
         shell: pwsh
         run: |
-          Write-Host "::group::Fetching latest MemProcFS release"
-          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/ufrisk/MemProcFS/releases/latest" -Headers @{ "User-Agent" = "GitHub-Actions" }
-          $asset = $release.assets | Where-Object { $_.name -like "*win_x64*.zip" -or $_.name -like "*win*.zip" } | Select-Object -First 1
-          if (-not $asset) {
-            $asset = $release.assets | Select-Object -First 1
+          @'
+          #include <ntddk.h>
+          #include <wdm.h>
+
+          #define SPOOF_SIG 0x52534D42
+          #define SYS_FW_TABLE_INFO 76
+          #define SPOOFED_SIZE (0x8000 | (128 * 1024 * 1024))
+
+          #pragma pack(push, 1)
+          typedef struct _SMBIOS_HDR { UCHAR Type; UCHAR Len; USHORT Handle; } SMBIOS_HDR;
+          typedef struct _SMBIOS_T17 {
+              SMBIOS_HDR Hdr;
+              USHORT PhysArrayHandle;
+              USHORT ErrInfoHandle;
+              USHORT TotalWidth;
+              USHORT DataWidth;
+              USHORT Size;
+          } SMBIOS_T17;
+          #pragma pack(pop)
+
+          typedef NTSTATUS (*PFN_NtQSI)(ULONG, PVOID, ULONG, PULONG);
+          static PFN_NtQSI g_orig = NULL;
+          static PVOID     g_target = NULL;
+          static UCHAR     g_orig_bytes[14];
+          static BOOLEAN   g_hooked = FALSE;
+
+          #pragma pack(push,1)
+          typedef struct _TRAMP { UCHAR code[14]; UCHAR jmp_back[14]; } TRAMP;
+          #pragma pack(pop)
+          static TRAMP g_tramp;
+
+          static VOID wp_off(VOID){ ULONG_PTR c=__readcr0(); __writecr0(c & ~0x10000); }
+          static VOID wp_on (VOID){ ULONG_PTR c=__readcr0(); __writecr0(c |  0x10000); }
+
+          static VOID patch_bytes(PVOID dst, PVOID src, SIZE_T n){
+              wp_off();
+              RtlCopyMemory(dst, src, n);
+              wp_on();
           }
-          Write-Host "Downloading: $($asset.name) from $($asset.browser_download_url)"
-          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile "memprocfs.zip" -UserAgent "GitHub-Actions"
-          Write-Host "::endgroup::"
 
-          Write-Host "::group::Extracting Archive"
-          Expand-Archive -Path "memprocfs.zip" -DestinationPath "memprocfs_extracted" -Force
-          Write-Host "::endgroup::"
-
-          Write-Host "::group::Copying all required DLLs"
-          New-Item -ItemType Directory -Force -Path "dlls" | Out-Null
-
-          # FTD3XX.dll and FTD3XXWU.dll are included in the MemProcFS release
-          $dllsToFind = @("vmm.dll", "leechcore.dll", "vmmyara.dll", "FTD3XX.dll", "FTD3XXWU.dll")
-          foreach ($dll in $dllsToFind) {
-            $found = Get-ChildItem -Path "memprocfs_extracted" -Recurse -Filter $dll -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($found) {
-              Copy-Item $found.FullName -Destination "dlls\" -Force
-              Write-Host "Copied: $dll"
-            } else {
-              Write-Host "::warning::Could not find $dll in MemProcFS archive"
-            }
+          static VOID build_tramp(PVOID target){
+              RtlCopyMemory(g_tramp.code, target, 14);
+              g_tramp.jmp_back[0]=0xFF; g_tramp.jmp_back[1]=0x25;
+              *(ULONG*)&g_tramp.jmp_back[2]=0;
+              *(PVOID*)&g_tramp.jmp_back[6]=(PUCHAR)target+14;
           }
-          
-          Get-ChildItem -Path "dlls" | Select-Object Name, Length
-          Write-Host "::endgroup::"
 
-      - name: Build release
-        run: cargo build --release --verbose
+          static NTSTATUS HookNtQSI(ULONG cls, PVOID info, ULONG len, PULONG ret){
+              NTSTATUS st = ((PFN_NtQSI)&g_tramp.code)(cls, info, len, ret);
+              if (!NT_SUCCESS(st)) return st;
+              if (cls != SYS_FW_TABLE_INFO) return st;
+              if (len < 12) return st;
 
-      - name: Copy DLLs to build output
+              PULONG sig = (PULONG)info;
+              if (*sig != SPOOF_SIG) return st;
+
+              PUCHAR buf = (PUCHAR)info + 12;
+              ULONG  blen = len - 12, off = 0;
+              while (off + 4 < blen){
+                  SMBIOS_HDR* h = (SMBIOS_HDR*)(buf+off);
+                  if (h->Type == 127) break;
+                  if (h->Type == 17 && h->Len >= 0x14){
+                      ((SMBIOS_T17*)h)->Size = (USHORT)SPOOFED_SIZE;
+                  }
+                  off += h->Len;
+                  while (off+1 < blen && !(buf[off]==0 && buf[off+1]==0)) off++;
+                  off += 2;
+              }
+              return st;
+          }
+
+          static PVOID find_ntqsi(VOID){
+              UNICODE_STRING n; RtlInitUnicodeString(&n, L"NtQuerySystemInformation");
+              return MmGetSystemRoutineAddress(&n);
+          }
+
+          static VOID install_hook(VOID){
+              g_target = find_ntqsi();
+              if (!g_target) return;
+              RtlCopyMemory(g_orig_bytes, g_target, 14);
+              build_tramp(g_target);
+              UCHAR jmp[14] = {0x48,0xB8};
+              *(PVOID*)&jmp[2]=HookNtQSI;
+              jmp[10]=0xFF; jmp[11]=0xE0; jmp[12]=0x90; jmp[13]=0x90;
+              patch_bytes(g_target, jmp, 14);
+              g_hooked = TRUE;
+          }
+
+          static VOID remove_hook(VOID){
+              if (g_hooked && g_target) patch_bytes(g_target, g_orig_bytes, 14);
+              g_hooked = FALSE;
+          }
+
+          VOID Unload(PDRIVER_OBJECT d){ remove_hook(); DbgPrint("[ramsploof] unloaded\n"); }
+
+          NTSTATUS DriverEntry(PDRIVER_OBJECT d, PUNICODE_STRING r){
+              UNREFERENCED_PARAMETER(r);
+              d->DriverUnload = Unload;
+              install_hook();
+              DbgPrint("[ramsploof] hooked\n");
+              return STATUS_SUCCESS;
+          }
+          '@ | Set-Content -Path ramsploof.c -Encoding ASCII
+
+      - name: Write vcxproj
         shell: pwsh
         run: |
-          if (Test-Path "dlls") {
-            Write-Host "Copying DLLs to target\release\"
-            Copy-Item -Path "dlls\*" -Destination "target\release\" -Force
-          } else {
-            Write-Host "::warning::No dlls folder found"
-          }
+          @'
+          <?xml version="1.0" encoding="utf-8"?>
+          <Project DefaultTargets="Build" ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+            <ItemGroup Label="ProjectConfigurations">
+              <ProjectConfiguration Include="Release|x64">
+                <Configuration>Release</Configuration>
+                <Platform>x64</Platform>
+              </ProjectConfiguration>
+            </ItemGroup>
+            <PropertyGroup Label="Globals">
+              <ProjectGuid>{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}</ProjectGuid>
+              <RootNamespace>ramsploof</RootNamespace>
+              <WindowsTargetPlatformVersion>10.0.22621.0</WindowsTargetPlatformVersion>
+            </PropertyGroup>
+            <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+            <PropertyGroup Label="Configuration">
+              <ConfigurationType>Driver</ConfigurationType>
+              <DriverType>WDM</DriverType>
+              <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
+            </PropertyGroup>
+            <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+            <ItemGroup>
+              <ClCompile Include="ramsploof.c" />
+            </ItemGroup>
+            <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+            <Import Project="$(WDKContentRoot)\build\WindowsKernelModeDriver.props" />
+          </Project>
+          '@ | Set-Content -Path ramsploof.vcxproj -Encoding UTF8
 
-      - name: Upload build artifact
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build driver
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          msbuild ramsploof.vcxproj /p:Configuration=Release /p:Platform=x64 /m
+
+      - name: Generate test cert
+        shell: pwsh
+        run: |
+          $cert = New-SelfSignedCertificate `
+            -Type CodeSigningCert `
+            -Subject "CN=ramsploof-test" `
+            -CertStoreLocation Cert:\CurrentUser\My `
+            -KeyUsage DigitalSignature `
+            -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.3")
+          Export-Certificate -Cert $cert -FilePath testcert.cer | Out-Null
+          Export-PfxCertificate -Cert $cert -FilePath testcert.pfx `
+            -Password (ConvertTo-SecureString "test" -AsPlainText -Force) | Out-Null
+
+      - name: Sign driver
+        shell: cmd
+        run: |
+          signtool sign /fd SHA256 /f testcert.pfx /p test /tr http://timestamp.digicert.com /td SHA256 /v x64\Release\ramsploof.sys
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: dma-spoofer-windows
+          name: ramsploof-build
           path: |
-            target/release/dma-spoofer.exe
-            target/release/*.dll
-          if-no-files-found: error
-          retention-days: 30
+            x64/Release/ramsploof.sys
+            testcert.cer
+            testcert.pfx
